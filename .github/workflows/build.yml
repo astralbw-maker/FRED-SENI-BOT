@@ -1,0 +1,252 @@
+name: Build FRED SENSI BOT (Expo / React Native)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build_android_apk:
+    name: Build FRED_SENSI_BOT.apk
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install dependencies
+        run: |
+          if [ -f yarn.lock ]; then
+            corepack enable
+            yarn install --frozen-lockfile
+          elif [ -f pnpm-lock.yaml ]; then
+            corepack enable
+            pnpm install --frozen-lockfile
+          elif [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Validate Expo Android config
+        run: |
+          node -e '
+            const { execSync } = require("child_process");
+            const cfg = JSON.parse(execSync("npx expo config --type public --json", { encoding: "utf8" }));
+            console.log("Expo App Name:", cfg.name);
+            console.log("Android Package:", cfg.android?.package || "MISSING");
+            if (!cfg.android?.package) {
+              console.error("ERROR: android.package is required in app.json / app.config.*");
+              process.exit(1);
+            }
+          '
+
+      - name: Run Expo Prebuild (if android/ does not exist)
+        run: |
+          if [ ! -d "android" ]; then
+            npx expo prebuild --platform android --no-install
+          else
+            echo "Existing android/ folder detected; skipping prebuild."
+          fi
+
+      - name: Build Release APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease
+
+      - name: Package & verify APK
+        run: |
+          APK_PATH=$(find android/app/build/outputs/apk/release -maxdepth 2 -name "*.apk" | head -n 1)
+          if [ -z "$APK_PATH" ] || [ ! -f "$APK_PATH" ]; then
+            echo "ERROR: No release APK found under android/app/build/outputs/apk/release"
+            exit 1
+          fi
+          echo "Found APK: $APK_PATH"
+          cp "$APK_PATH" FRED_SENSI_BOT.apk
+          ls -lh FRED_SENSI_BOT.apk
+
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name "apksigner" | sort -V | tail -n 1 || true)
+          if [ -n "$APKSIGNER" ]; then
+            "$APKSIGNER" verify --print-certs FRED_SENSI_BOT.apk || {
+              echo "WARNING: FRED_SENSI_BOT.apk is unsigned (app-release-unsigned.apk)."
+              echo "Android requires a signature to install. Configure signingConfigs.release in android/app/build.gradle or sign before installing."
+            }
+          fi
+
+      - name: Upload FRED_SENSI_BOT.apk
+        uses: actions/upload-artifact@v4
+        with:
+          name: FRED_SENSI_BOT_APK
+          path: FRED_SENSI_BOT.apk
+          if-no-files-found: error
+
+  build_ios_unsigned_ipa:
+    name: Build Unsigned FRED_SENSI_BOT.ipa
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check Xcode version on runner
+        run: xcodebuild -version
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: |
+          if [ -f yarn.lock ]; then
+            corepack enable
+            yarn install --frozen-lockfile
+          elif [ -f pnpm-lock.yaml ]; then
+            corepack enable
+            pnpm install --frozen-lockfile
+          elif [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Validate Expo iOS config
+        run: |
+          node -e '
+            const { execSync } = require("child_process");
+            const cfg = JSON.parse(execSync("npx expo config --type public --json", { encoding: "utf8" }));
+            console.log("Expo App Name:", cfg.name);
+            console.log("iOS Bundle Identifier:", cfg.ios?.bundleIdentifier || "MISSING");
+            if (!cfg.ios?.bundleIdentifier) {
+              console.error("ERROR: ios.bundleIdentifier is required in app.json / app.config.*");
+              process.exit(1);
+            }
+          '
+
+      - name: Run Expo Prebuild & CocoaPods (if needed)
+        env:
+          LANG: en_US.UTF-8
+          LC_ALL: en_US.UTF-8
+        run: |
+          if [ ! -d "ios" ]; then
+            npx expo prebuild --platform ios --no-install
+          else
+            echo "Existing ios/ folder detected; skipping prebuild."
+          fi
+          if [ -f "ios/Podfile" ]; then
+            cd ios && pod install
+          fi
+
+      - name: Archive unsigned Release iphoneos build
+        env:
+          LANG: en_US.UTF-8
+          LC_ALL: en_US.UTF-8
+        run: |
+          WORKSPACE=$(find ios -maxdepth 1 -name "*.xcworkspace" | head -n 1 || true)
+          XCODEPROJ=$(find ios -maxdepth 1 -name "*.xcodeproj" | head -n 1 || true)
+
+          if [ -n "$WORKSPACE" ]; then
+            CONTAINER_FLAG="-workspace"
+            CONTAINER_PATH="$WORKSPACE"
+            LIST_KEY="workspace"
+          elif [ -n "$XCODEPROJ" ]; then
+            CONTAINER_FLAG="-project"
+            CONTAINER_PATH="$XCODEPROJ"
+            LIST_KEY="project"
+          else
+            echo "ERROR: Neither .xcworkspace nor .xcodeproj found in ios/"
+            exit 1
+          fi
+
+          echo "Using $CONTAINER_FLAG $CONTAINER_PATH"
+
+          SCHEME=$(xcodebuild "$CONTAINER_FLAG" "$CONTAINER_PATH" -list -json | node -e '
+            const fs = require("fs");
+            const data = JSON.parse(fs.readFileSync(0, "utf8"));
+            const schemes = (data.workspace?.schemes || data.project?.schemes || []);
+            const appScheme = schemes.find(s => !s.startsWith("Pods-")) || schemes[0];
+            if (!appScheme) process.exit(1);
+            process.stdout.write(appScheme);
+          ')
+          echo "Detected Scheme: $SCHEME"
+
+          if [ ! -f ios/.xcode.env.local ]; then
+            echo "export NODE_BINARY=$(command -v node)" > ios/.xcode.env.local
+          fi
+
+          xcodebuild \
+            "$CONTAINER_FLAG" "$CONTAINER_PATH" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath ios/build/FREDSENSIBOT.xcarchive \
+            archive \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Verify & package unsigned .ipa for ESign
+        run: |
+          APP_PATH=$(find ios/build/FREDSENSIBOT.xcarchive/Products/Applications -maxdepth 1 -name "*.app" -type d | head -n 1)
+          if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then
+            echo "ERROR: .app bundle not found in archive Products/Applications/"
+            exit 1
+          fi
+          echo "Found .app bundle: $APP_PATH"
+
+          PLIST="$APP_PATH/Info.plist"
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$PLIST")
+          EXEC_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$PLIST")
+          PLATFORM=$(/usr/libexec/PlistBuddy -c "Print :DTPlatformName" "$PLIST")
+
+          echo "CFBundleIdentifier: $BUNDLE_ID"
+          echo "CFBundleExecutable: $EXEC_NAME"
+          echo "DTPlatformName: $PLATFORM"
+
+          if [ "$PLATFORM" != "iphoneos" ]; then
+            echo "ERROR: Expected DTPlatformName=iphoneos, got $PLATFORM"
+            exit 1
+          fi
+
+          if [ ! -f "$APP_PATH/$EXEC_NAME" ]; then
+            echo "ERROR: Missing Mach-O executable $EXEC_NAME in $APP_PATH"
+            exit 1
+          fi
+
+          file "$APP_PATH/$EXEC_NAME"
+          lipo -info "$APP_PATH/$EXEC_NAME"
+
+          if [ ! -f "$APP_PATH/main.jsbundle" ]; then
+            echo "ERROR: main.jsbundle missing inside .app — JS bundle was not embedded for offline Release execution."
+            exit 1
+          fi
+
+          rm -rf build_ipa
+          mkdir -p build_ipa/Payload
+          cp -R "$APP_PATH" build_ipa/Payload/
+          (cd build_ipa && zip -r -y -9 ../FRED_SENSI_BOT.ipa Payload)
+
+          echo "=== IPA Archive Verification ==="
+          unzip -l FRED_SENSI_BOT.ipa | head -n 30
+          ls -lh FRED_SENSI_BOT.ipa
+
+      - name: Upload FRED_SENSI_BOT.ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: FRED_SENSI_BOT_IPA
+          path: FRED_SENSI_BOT.ipa
+          if-no-files-found: error
